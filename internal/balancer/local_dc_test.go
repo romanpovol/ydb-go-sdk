@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -240,241 +241,282 @@ func TestGetRandomEndpoints(t *testing.T) {
 }
 
 func TestBalancer_SmallDCDistribution(t *testing.T) {
-	xtest.TestManyTimesWithName(t, "SmallLocalDCDistribution", func(t testing.TB) {
-		cfg := config.New(
-			config.WithBalancer(
-				balancers.PreferNearestDC(
-					balancers.RandomChoice(),
+	type testCaseData struct {
+		info                  string
+		endpointsPerDC        map[string]int
+		localDC               string
+		totalRequests         int
+		localDCMinLoadPercent float64
+		localDCMaxLoadPercent float64
+	}
+
+	testCases := []testCaseData{
+		{
+			info: "100_100_2",
+			endpointsPerDC: map[string]int{
+				"dc1": 100,
+				"dc2": 100,
+				"dc3": 2,
+			},
+			localDC:               "dc3",
+			totalRequests:         1000,
+			localDCMinLoadPercent: 30,
+			localDCMaxLoadPercent: 80,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.info, func(t *testing.T) {
+			cfg := config.New(
+				config.WithBalancer(
+					balancers.PreferNearestDC(
+						balancers.RandomChoice(),
+					),
 				),
-			),
-		)
+			)
 
-		pool := conn.NewPool(context.Background(), cfg)
+			pool := conn.NewPool(context.Background(), cfg)
 
-		var endpoints []endpoint.Endpoint
-		for i := 0; i < 100; i++ {
-			endpoints = append(endpoints, &mock.Endpoint{
-				AddrField:     fmt.Sprintf("grpc://dc1-%d:123", i),
-				LocationField: "dc1",
-			})
-		}
-		for i := 0; i < 100; i++ {
-			endpoints = append(endpoints, &mock.Endpoint{
-				AddrField:     fmt.Sprintf("grpc://dc2-%d:123", i),
-				LocationField: "dc2",
-			})
-		}
-		for i := 0; i < 2; i++ {
-			endpoints = append(endpoints, &mock.Endpoint{
-				AddrField:     fmt.Sprintf("grpc://dc3-%d:123", i),
-				LocationField: "dc3",
-			})
-		}
+			var endpoints []endpoint.Endpoint
+			endpointCounter := make(map[string]int)
 
-		r := &Balancer{
-			driverConfig:   cfg,
-			balancerConfig: *cfg.Balancer(),
-			pool:           pool,
-			discover: func(ctx context.Context, _ *grpc.ClientConn) ([]endpoint.Endpoint, string, error) {
-				return endpoints, "", nil
-			},
-			localDCDetector: func(ctx context.Context, eps []endpoint.Endpoint) (string, error) {
-				return "dc3", nil
-			},
-		}
+			for dc, amountEndpoints := range tc.endpointsPerDC {
+				for i := 0; i < amountEndpoints; i++ {
+					endpointCounter[dc]++
+					endpoints = append(endpoints, &mock.Endpoint{
+						AddrField:     fmt.Sprintf("grpc://%s-%d:123", dc, endpointCounter[dc]),
+						LocationField: dc,
+					})
+				}
+			}
 
-		err := r.clusterDiscoveryAttempt(context.Background(), nil)
-		require.NoError(t, err)
+			r := &Balancer{
+				driverConfig:   cfg,
+				balancerConfig: *cfg.Balancer(),
+				pool:           pool,
+				discover: func(ctx context.Context, _ *grpc.ClientConn) ([]endpoint.Endpoint, string, error) {
+					return endpoints, "", nil
+				},
+				localDCDetector: func(ctx context.Context, eps []endpoint.Endpoint) (string, error) {
+					return tc.localDC, nil
+				},
+			}
 
-		dcCount := make(map[string]int)
-		totalRequests := 1000
+			err := r.clusterDiscoveryAttempt(context.Background(), nil)
+			require.NoError(t, err)
 
-		for i := 0; i < totalRequests; i++ {
-			c, _ := r.connections().GetConnection(context.Background())
-			loc := c.Endpoint().Location()
-			dcCount[loc]++
-		}
+			dcCounter := make(map[string]int)
 
-		t.Logf("Distribution: dc1=%d (%.1f), dc2=%d (%.1f), dc3=%d (%.1f)",
-			dcCount["dc1"], float64(dcCount["dc1"])/float64(totalRequests),
-			dcCount["dc2"], float64(dcCount["dc2"])/float64(totalRequests),
-			dcCount["dc3"], float64(dcCount["dc3"])/float64(totalRequests),
-		)
+			for i := 0; i < tc.totalRequests; i++ {
+				c, _ := r.connections().GetConnection(context.Background())
+				loc := c.Endpoint().Location()
+				dcCounter[loc]++
+			}
 
-		require.Less(t, dcCount["dc3"], totalRequests/3)
+			distributionBuilder := strings.Builder{}
+			distributionBuilder.WriteString("Distribution per DC:")
+			for dc := range tc.endpointsPerDC {
+				distributionBuilder.WriteString(fmt.Sprintf("\n--- %s: %d (%.1f%%)", dc, dcCounter[dc],
+					float64(dcCounter[dc])/float64(tc.totalRequests)*100))
+			}
 
-		require.Greater(t, dcCount["dc1"], 0)
-		require.Greater(t, dcCount["dc2"], 0)
-		require.Greater(t, dcCount["dc3"], 0)
-	})
+			t.Log(distributionBuilder.String())
+
+			localDCPercentage := float64(dcCounter[tc.localDC]) / float64(tc.totalRequests) * 100
+
+			require.Greater(t, localDCPercentage, tc.localDCMinLoadPercent,
+				"Local DC should handle at least %.1f%% (was %.1f%%)", tc.localDCMinLoadPercent, localDCPercentage,
+			)
+
+			require.Less(t, localDCPercentage, tc.localDCMinLoadPercent,
+				"Local DC should handle at most %.1f%% (was %.1f%%)", tc.localDCMaxLoadPercent, localDCPercentage,
+			)
+		})
+	}
 }
 
 func TestBalancer_TestSmallDCRequestsHandlingSimulation(t *testing.T) {
-	xtest.TestManyTimesWithName(t, "SmallDCRequestsHandlingSimulation", func(t testing.TB) {
-		cfg := config.New(
-			config.WithBalancer(
-				balancers.PreferNearestDC(
-					balancers.RandomChoice(),
+	type testCaseData struct {
+		info                  string
+		endpointsPerDC        map[string]int
+		localDC               string
+		maxConnsPerEndpoint   int
+		workDuration          time.Duration
+		totalRequests         int
+		localDCMinLoadPercent float64
+		localDCMaxLoadPercent float64
+	}
+
+	testCases := []testCaseData{
+		{
+			info: "100_100_2",
+			endpointsPerDC: map[string]int{
+				"dc1": 100,
+				"dc2": 100,
+				"dc3": 2,
+			},
+			localDC:               "dc3",
+			maxConnsPerEndpoint:   10,
+			workDuration:          10 * time.Millisecond,
+			totalRequests:         1000,
+			localDCMinLoadPercent: 30,
+			localDCMaxLoadPercent: 80,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.info, func(t *testing.T) {
+			cfg := config.New(
+				config.WithBalancer(
+					balancers.PreferNearestDC(
+						balancers.RandomChoice(),
+					),
 				),
-			),
-		)
+			)
 
-		pool := conn.NewPool(context.Background(), cfg)
+			pool := conn.NewPool(context.Background(), cfg)
 
-		type server struct {
-			location string
-			sem      chan struct{}
-			success  atomic.Int32
-			errors   atomic.Int32
-		}
-
-		servers := make(map[string]*server)
-		var endpoints []endpoint.Endpoint
-
-		for i := 0; i < 100; i++ {
-			addr := fmt.Sprintf("grpc://dc1-%d:123", i)
-			s := &server{
-				location: "dc1",
-				sem:      make(chan struct{}, 10),
+			type server struct {
+				location  string
+				semaphore chan struct{}
+				success   atomic.Int32
+				errors    atomic.Int32
 			}
-			servers[addr] = s
-			endpoints = append(endpoints, &mock.Endpoint{
-				AddrField:     addr,
-				LocationField: "dc1",
-			})
-		}
 
-		for i := 0; i < 100; i++ {
-			addr := fmt.Sprintf("grpc://dc2-%d:123", i)
-			s := &server{
-				location: "dc2",
-				sem:      make(chan struct{}, 10),
+			servers := make(map[string]*server)
+			var endpoints []endpoint.Endpoint
+			endpointCounter := make(map[string]int)
+
+			for dc, amountEndpoints := range tc.endpointsPerDC {
+				for i := 0; i < amountEndpoints; i++ {
+					endpointCounter[dc]++
+					addr := fmt.Sprintf("grpc://%s-%d:123", dc, endpointCounter[dc])
+					s := &server{
+						location:  dc,
+						semaphore: make(chan struct{}, tc.maxConnsPerEndpoint),
+					}
+					servers[addr] = s
+					endpoints = append(endpoints, &mock.Endpoint{
+						AddrField:     addr,
+						LocationField: dc,
+					})
+				}
 			}
-			servers[addr] = s
-			endpoints = append(endpoints, &mock.Endpoint{
-				AddrField:     addr,
-				LocationField: "dc2",
-			})
-		}
 
-		for i := 0; i < 2; i++ {
-			addr := fmt.Sprintf("grpc://dc3-%d:123", i)
-			s := &server{
-				location: "dc3",
-				sem:      make(chan struct{}, 10),
+			r := &Balancer{
+				driverConfig:   cfg,
+				balancerConfig: *cfg.Balancer(),
+				pool:           pool,
+				discover: func(ctx context.Context, _ *grpc.ClientConn) ([]endpoint.Endpoint, string, error) {
+					return endpoints, "", nil
+				},
+				localDCDetector: func(ctx context.Context, eps []endpoint.Endpoint) (string, error) {
+					return tc.localDC, nil
+				},
 			}
-			servers[addr] = s
-			endpoints = append(endpoints, &mock.Endpoint{
-				AddrField:     addr,
-				LocationField: "dc3",
+
+			err := r.clusterDiscoveryAttempt(context.Background(), nil)
+			require.NoError(t, err)
+
+			var wg sync.WaitGroup
+			start := time.Now()
+			successCount := atomic.Int32{}
+			errorCount := atomic.Int32{}
+
+			for i := 0; i < tc.totalRequests; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+					defer cancel()
+
+					conn, _ := r.connections().GetConnection(ctx)
+					address := conn.Endpoint().Address()
+					server, ok := servers[address]
+					if !ok {
+						errorCount.Add(1)
+						t.Logf("Something wrong with server address: %s", address)
+						return
+					}
+
+					select {
+					case server.semaphore <- struct{}{}:
+						defer func() { <-server.semaphore }()
+						time.Sleep(tc.workDuration)
+						server.success.Add(1)
+						successCount.Add(1)
+					default:
+						server.errors.Add(1)
+						errorCount.Add(1)
+					}
+				}()
+			}
+
+			wg.Wait()
+			duration := time.Since(start)
+
+			results := make(map[string]struct {
+				success int32
+				errors  int32
 			})
-		}
 
-		r := &Balancer{
-			driverConfig:   cfg,
-			balancerConfig: *cfg.Balancer(),
-			pool:           pool,
-			discover: func(ctx context.Context, _ *grpc.ClientConn) ([]endpoint.Endpoint, string, error) {
-				return endpoints, "", nil
-			},
-			localDCDetector: func(ctx context.Context, eps []endpoint.Endpoint) (string, error) {
-				return "dc3", nil
-			},
-		}
-
-		err := r.clusterDiscoveryAttempt(context.Background(), nil)
-		require.NoError(t, err)
-
-		totalRequests := 1000
-		var wg sync.WaitGroup
-		start := time.Now()
-		successCount := atomic.Int32{}
-		errorCount := atomic.Int32{}
-
-		for i := 0; i < totalRequests; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-				defer cancel()
-
-				conn, _ := r.connections().GetConnection(ctx)
-
-				addr := conn.Endpoint().Address()
-				srv, ok := servers[addr]
+			for _, srv := range servers {
+				dcResult, ok := results[srv.location]
 				if !ok {
-					errorCount.Add(1)
-					return
+					dcResult = struct {
+						success int32
+						errors  int32
+					}{0, 0}
 				}
 
-				select {
-				case srv.sem <- struct{}{}:
-					defer func() { <-srv.sem }()
-					time.Sleep(10 * time.Millisecond)
-					srv.success.Add(1)
-					successCount.Add(1)
-				default:
-					srv.errors.Add(1)
-					errorCount.Add(1)
-				}
-			}()
-		}
-
-		wg.Wait()
-		duration := time.Since(start)
-
-		var (
-			dc1Success int32
-			dc1Errors  int32
-
-			dc2Success int32
-			dc2Errors  int32
-
-			dc3Success int32
-			dc3Errors  int32
-		)
-
-		for _, srv := range servers {
-			success := srv.success.Load()
-			errors := srv.errors.Load()
-
-			switch srv.location {
-			case "dc1":
-				dc1Success += success
-				dc1Errors += errors
-			case "dc2":
-				dc2Success += success
-				dc2Errors += errors
-			case "dc3":
-				dc3Success += success
-				dc3Errors += errors
+				dcResult.success += srv.success.Load()
+				dcResult.errors += srv.errors.Load()
+				results[srv.location] = dcResult
 			}
-		}
 
-		totalSuccess := successCount.Load()
-		totalErrors := errorCount.Load()
-		dc3Total := dc3Success + dc3Errors
-		dc3Percentage := float64(dc3Total) / float64(totalRequests) * 100
+			totalSuccess := successCount.Load()
+			totalErrors := errorCount.Load()
+			localDCLoad := results[tc.localDC]
+			localDCTotal := localDCLoad.success + localDCLoad.errors
+			localDCPercentage := float64(localDCTotal) / float64(tc.totalRequests) * 100
 
-		t.Logf("Load test results:")
-		t.Logf("Total requests: %d", totalRequests)
-		t.Logf("Successful requests: %d (%.1f%%)", totalSuccess, float64(totalSuccess)/float64(totalRequests)*100)
-		t.Logf("Failed requests: %d (%.1f%%)", totalErrors, float64(totalErrors)/float64(totalRequests)*100)
-		t.Logf("DC1: success=%d, errors=%d", dc1Success, dc1Errors)
-		t.Logf("DC2: success=%d, errors=%d", dc2Success, dc2Errors)
-		t.Logf("DC3: success=%d, errors=%d", dc3Success, dc3Errors)
-		t.Logf("DC3 load percentage: %.1f%%", dc3Percentage)
-		t.Logf("Total duration: %v", duration)
-		t.Logf("RPS: %.1f", float64(totalRequests)/duration.Seconds())
+			distributionBuilder := strings.Builder{}
+			distributionBuilder.WriteString("--- Distribution per DC:")
+			for dc := range tc.endpointsPerDC {
+				resultDC := results[dc]
+				allRequestsToDC := resultDC.success + resultDC.errors
+				percentage := float64(allRequestsToDC) / float64(tc.totalRequests) * 100
+				distributionBuilder.WriteString(fmt.Sprintf("\n--- %s: %d (%.1f%%) [success: %d, errors: %d]",
+					dc, allRequestsToDC, percentage, resultDC.success, resultDC.errors))
+			}
 
-		require.Less(t,
-			90.0, dc3Percentage,
-			"DC3 should handle more than 90%% of requests (handled %.1f%%)", dc3Percentage,
-		)
+			t.Logf("Test case %s", tc.info)
+			t.Logf("Configuration:")
+			t.Logf("--- Endpoints per DC: %v", tc.endpointsPerDC)
+			t.Logf("--- Local DC: %s", tc.localDC)
+			t.Logf("--- Max conns per endpoint: %d", tc.maxConnsPerEndpoint)
+			t.Logf("--- Work duration: %v", tc.workDuration)
+			t.Logf("--- Total requests: %d", tc.totalRequests)
+			t.Logf("Results:")
+			t.Logf("--- Successful requests: %d (%.1f%%)", totalSuccess, float64(totalSuccess)/float64(tc.totalRequests)*100)
+			t.Logf("--- Failed requests: %d (%.1f%%)", totalErrors, float64(totalErrors)/float64(tc.totalRequests)*100)
+			t.Log(distributionBuilder.String())
+			t.Logf("--- Local DC (%s) load: %d requests (%.1f%%)", tc.localDC, localDCTotal, localDCPercentage)
+			t.Logf("--- Total duration: %v", duration)
 
-		require.Greater(t,
-			totalSuccess, int32(totalRequests*9/10),
-			"Success rate should be at least 90%% (was %.1f%%)",
-			float64(totalSuccess)/float64(totalRequests)*100)
-	})
+			require.Greater(t, localDCPercentage, tc.localDCMinLoadPercent,
+				"Local DC should handle at least %.1f%% (was %.1f%%)", tc.localDCMinLoadPercent, localDCPercentage,
+			)
+
+			require.Less(t, localDCPercentage, tc.localDCMinLoadPercent,
+				"Local DC should handle at most %.1f%% (was %.1f%%)", tc.localDCMaxLoadPercent, localDCPercentage,
+			)
+
+			require.Greater(t,
+				totalSuccess, int32(tc.totalRequests*9/10),
+				"Success rate should be at least 90%% (was %.1f%%)",
+				float64(totalSuccess)/float64(tc.totalRequests)*100,
+			)
+		})
+	}
 }
